@@ -1,0 +1,373 @@
+m6const net = require('net');
+const bitcoin = require('bitcoin');
+const winston = require('winston');
+const async = require('async');
+const express = require('express');
+const moment = require('moment');
+
+// Configure logging with your username and UTC time
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp({
+            format: 'YYYY-MM-DD HH:mm:ss'
+        }),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: 'proxy.log' })
+    ]
+});
+
+// Your specific Veil node RPC configuration
+const client = new bitcoin.Client({
+    host: 'localhost',
+    port: 5555,  // Your configured RPC port
+    user: 'Mills',
+    pass: 'Mills'
+});
+
+// Supported algorithms
+const ALGORITHMS = {
+    'progpow-veil': 'progpow',
+    'sha256d': 'sha256d',
+    'randomx-veil': 'randomx'
+};
+
+// Store connected clients
+const clients = new Set();
+let currentJobs = new Map();
+let jobCounter = 0;
+
+// Express server for monitoring
+const app = express();
+const PORT = 3333;
+const MONITOR_PORT = 3334;
+
+// Function to get difficulty for each algorithm
+function getDifficultyForAlgo(algo) {
+    switch(algo) {
+        case 'progpow':
+            return 0.002;
+        case 'sha256d':
+            return 0.01;
+        case 'randomx':
+            return 0.005;
+        default:
+            return 0.01;
+    }
+}
+
+// Create mining job based on algorithm
+async function createMiningJob(algo) {
+    return new Promise((resolve, reject) => {
+        client.getblocktemplate({ rules: ['segwit'] }, (err, template) => {
+            if (err) {
+                logger.error('Error getting block template:', err);
+                return reject(err);
+            }
+
+            const job = {
+                job_id: `${algo}-${++jobCounter}`,
+                algorithm: algo,
+                prevhash: template.previousblockhash,
+                coinbase: template.coinbasetxn,
+                version: template.version,
+                nbits: template.bits,
+                ntime: template.curtime,
+                clean_jobs: true,
+                difficulty: getDifficultyForAlgo(algo)
+            };
+
+            // Algorithm-specific modifications
+            switch (algo) {
+                case 'progpow':
+                    job.progpow_header = template.progpow_header;
+                    job.progpow_mix_hash = template.progpow_mix_hash;
+                    break;
+                case 'sha256d':
+                    job.merkle = template.merkle_root;
+                    break;
+                case 'randomx':
+                    job.seed_hash = template.randomx_seed;
+                    break;
+            }
+
+            currentJobs.set(job.job_id, job);
+            resolve(job);
+        });
+    });
+}
+
+// Handle stratum method calls
+async function handleStratumMethod(client, message) {
+    const { id, method, params } = message;
+
+    try {
+        switch (method) {
+            case 'mining.subscribe':
+                const [algo, clientId] = params;
+                if (!ALGORITHMS[algo]) {
+                    return {
+                        id,
+                        error: 'Unsupported algorithm',
+                        result: null
+                    };
+                }
+
+                client.algorithm = ALGORITHMS[algo];
+                client.difficulty = getDifficultyForAlgo(client.algorithm);
+
+                // Send difficulty first
+                client.socket.write(JSON.stringify({
+                    id: null,
+                    method: 'mining.set_difficulty',
+                    params: [client.difficulty]
+                }) + '\n');
+
+                return {
+                    id,
+                    result: [
+                        [
+                            [`mining.set_difficulty`, `${id}`],
+                            [`mining.notify`, `${id}`]
+                        ],
+                        `${clientId}`,
+                        '08'
+                    ],
+                    error: null
+                };
+
+case 'mining.authorize':
+    const [username, password] = params;
+    logger.info(`Authorization attempt from ${username} with password ${password}`);
+
+    // Accept any valid credentials for testing
+    client.authorized = true;
+    client.wallet = username;
+
+    logger.info(`Miner authorized: ${username} using ${client.algorithm}`);
+
+    // Send initial job after authorization
+    try {
+        const job = await createMiningJob(client.algorithm);
+        sendMiningJob(client, job);
+        logger.info(`Initial job sent to ${username}`);
+    } catch (error) {
+        logger.error(`Error creating initial job: ${error.message}`);
+    }
+
+    return {
+        id,
+        result: true,
+        error: null
+    };
+
+            case 'mining.submit':
+                if (!client.authorized) {
+                    return {
+                        id,
+                        error: 'Unauthorized worker',
+                        result: null
+                    };
+                }
+
+                const [worker, jobId, nonce, header, mixHash] = params;
+                const submission = {
+                    algo: client.algorithm,
+                    worker,
+                    jobId,
+                    nonce,
+                    header,
+                    mixHash
+                };
+
+                try {
+                    await submitWork(submission);
+                    logger.info(`Share accepted: ${worker} [${client.algorithm}]`);
+                    return {
+                        id,
+                        result: true,
+                        error: null
+                    };
+                } catch (error) {
+                    logger.error(`Share rejected: ${worker} [${client.algorithm}] - ${error.message}`);
+                    return {
+                        id,
+                        error: error.message,
+                        result: null
+                    };
+                }
+        }
+    } catch (error) {
+        logger.error('Error handling stratum method:', error);
+        return {
+            id,
+            error: 'Internal error',
+            result: null
+        };
+    }
+}
+
+// Submit work to Veil node
+async function submitWork(submission) {
+    return new Promise((resolve, reject) => {
+        let params;
+        switch (submission.algo) {
+            case 'progpow':
+                params = [submission.header, submission.mixHash, submission.nonce];
+                break;
+            case 'sha256d':
+                params = [submission.header, submission.nonce];
+                break;
+            case 'randomx':
+                params = [submission.header, submission.nonce];
+                break;
+            default:
+                return reject(new Error('Invalid algorithm'));
+        }
+
+        client.submitblock(params, (err, result) => {
+            if (err) {
+                logger.error('Submit work error:', err);
+                reject(err);
+            } else {
+                resolve(result);
+            }
+        });
+    });
+}
+
+// Send mining job to client
+function sendMiningJob(client, job) {
+    if (!client.socket || !client.authorized) return;
+
+    const miningNotify = {
+        id: null,
+        method: 'mining.notify',
+        params: [
+            job.job_id,
+            job.prevhash,
+            job.coinbase,
+            job.version,
+            job.nbits,
+            job.ntime,
+            true // clean_jobs
+        ]
+    };
+
+    // Add algorithm-specific parameters
+    switch (client.algorithm) {
+        case 'progpow':
+            miningNotify.params.push(job.progpow_header, job.progpow_mix_hash);
+            break;
+        case 'sha256d':
+            miningNotify.params.push(job.merkle);
+            break;
+        case 'randomx':
+            miningNotify.params.push(job.seed_hash);
+            break;
+    }
+
+    try {
+        client.socket.write(JSON.stringify(miningNotify) + '\n');
+    } catch (error) {
+        logger.error('Error sending job:', error);
+        clients.delete(client);
+    }
+}
+
+// Create stratum server
+const server = net.createServer((socket) => {
+    const client = {
+        socket,
+        algorithm: null,
+        authorized: false,
+        wallet: null,
+        difficulty: null,
+        connected: moment().utc().format('YYYY-MM-DD HH:mm:ss')
+    };
+
+    clients.add(client);
+    logger.info(`New connection from ${socket.remoteAddress}`);
+
+    socket.on('data', (data) => {
+        const messages = data.toString().split('\n');
+        messages.forEach(async (message) => {
+            if (!message) return;
+
+            try {
+                const parsed = JSON.parse(message);
+                const response = await handleStratumMethod(client, parsed);
+                if (response) {
+                    socket.write(JSON.stringify(response) + '\n');
+                }
+            } catch (error) {
+                logger.error('Error processing message:', error);
+                socket.write(JSON.stringify({
+                    id: null,
+                    error: 'Invalid message',
+                    result: null
+                }) + '\n');
+            }
+        });
+    });
+
+    socket.on('end', () => {
+        clients.delete(client);
+        logger.info(`Client disconnected: ${client.wallet || 'unauthorized'}`);
+    });
+
+    socket.on('error', (error) => {
+        logger.error('Socket error:', error);
+        clients.delete(client);
+    });
+});
+
+// Setup monitoring endpoint
+app.get('/status', (req, res) => {
+    const status = {
+        uptime: process.uptime(),
+        connections: Array.from(clients).map(client => ({
+            algorithm: client.algorithm,
+            wallet: client.wallet,
+            connected: client.connected,
+            authorized: client.authorized
+        })),
+        currentJobs: currentJobs.size
+    };
+    res.json(status);
+});
+
+// Start servers
+server.listen(PORT, '0.0.0.0', () => {
+    logger.info(`Stratum proxy server started on port ${PORT}`);
+});
+
+app.listen(MONITOR_PORT, '0.0.0.0', () => {
+    logger.info(`Monitoring server started on port ${MONITOR_PORT}`);
+});
+
+// Block template updates
+setInterval(async () => {
+    for (const client of clients) {
+        if (client.authorized) {
+            try {
+                const job = await createMiningJob(client.algorithm);
+                sendMiningJob(client, job);
+            } catch (error) {
+                logger.error('Error creating job:', error);
+            }
+        }
+    }
+}, 30000); // Update every 30 seconds
+
+// Error handling for uncaught exceptions
+process.on('uncaughtException', (error) => {
+    logger.error('Uncaught exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled rejection:', reason);
+});
