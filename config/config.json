@@ -1,0 +1,17 @@
+{
+    "proxy": {
+        "port": 3333,
+        "host": "0.0.0.0"
+    },
+    "veil": {
+        "host": "host.docker.internal",
+        "port": 5555,
+        "username": "Mills",
+        "password": "Mills"
+    },
+    "logging": {
+        "level": "debug",
+        "file": "logs/proxy.log"
+    }
+}
+
