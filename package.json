@@ -1,0 +1,19 @@
+{
+  "name": "veil-node-stratum-proxy",
+  "version": "1.0.0",
+  "description": "Veil Node Stratum Proxy (ProgPoW, SHA256D, RandomX)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "async": "^3.2.0",
+    "bignum": "^0.13.1",
+    "winston": "^3.3.3",
+    "express": "^4.17.1",
+    "http-proxy": "^1.18.1",
+    "moment": "^2.29.1",
+    "request": "^2.88.2",
+    "bitcoin": "^3.0.1"
+  }
+}
